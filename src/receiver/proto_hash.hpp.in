@@ -1,0 +1,20 @@
+#pragma once
+// =============================================================================
+// GENERATED FILE -- do not edit, do not commit the generated output (only
+// this .in template is checked in). Produced by CMake's configure_file()
+// from cmake/proto_hash.py's output over libs/nexus-proto/proto/*.proto.
+//
+// The 32-byte BLAKE3 digest baked in here is the receiver's proto_hash
+// (rx.proto ReceiverHello.proto_hash) -- see cmake/proto_hash.py's own
+// docstring for the exact algorithm and why it's computed at build time
+// rather than runtime: the schema a binary was compiled against can't
+// change while it runs, so there's nothing to gain from recomputing it on
+// every startup, and this way the built binary has ZERO BLAKE3 dependency
+// -- only the build machine needs Python's blake3 package.
+// =============================================================================
+
+#include <cstddef>
+#include <cstdint>
+
+inline constexpr uint8_t NEXUS_PROTO_HASH[32] = { @NEXUS_PROTO_HASH_BYTES@ };
+inline constexpr size_t  NEXUS_PROTO_HASH_SIZE = 32;
