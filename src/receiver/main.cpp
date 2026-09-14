@@ -74,6 +74,11 @@ bool open_or_create_shm(ShmManager& shm) {
 } // namespace
 
 int main(int argc, char** argv) {
+    // Line-buffered stdout: this process's log lines go through the
+    // supervisor's pipe (fully buffered by default), and a receiver that
+    // silently drops packets is undebuggable -- the sender does the same
+    // (sender/main.cpp). Every [receiver] line below depends on this.
+    ::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::string error;
     const auto args = parse_receiver_args(argc, argv, &error);
     if (!args) {
