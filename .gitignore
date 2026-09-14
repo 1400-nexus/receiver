@@ -15,8 +15,6 @@ install_manifest.txt
 Makefile
 # This is a very important file for VS Code Intellisense
 compile_commands.json
-tests/
-docs/
 
 # --- Object Files & Binaries ---
 *.o
