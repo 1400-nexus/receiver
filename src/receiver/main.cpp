@@ -46,20 +46,27 @@ constexpr int kHeartbeatIntervalMs = 1000; // RECEIVER_CONTRACT.md §5 property 
 // Opens this process's own private SHM segment (docs/PHASE9_DESIGN.md --
 // entirely receiver-owned, no coordination with session_manager's "nxrx").
 // Whichever of the (up to 3) receiver processes gets here first creates
-// it; the rest attach to what's already there. This does NOT yet
-// replicate session_manager's own liveness-probing adopt-vs-create logic
-// (docs/ANSWERS_FROM_C.md §3/§4) -- a genuine simplification, flagged
-// rather than silently assumed equivalent: a receiver restarting after a
-// crash currently just re-attaches to whatever is there, with no check
-// for whether the segment's contents are stale from a boot that's gone.
+// it (O_EXCL -- exactly one winner); the rest attach to what's already
+// there. The loop is the whole protocol: a loser may find the segment
+// mid-creation (size 0, header not yet valid) and must retry rather than
+// fail -- open() rejects those states cleanly, so this spins briefly
+// instead. Persistent failure still returns false and the supervisor
+// restarts the process, which is the outer retry.
 bool open_or_create_shm(ShmManager& shm) {
-    if (shm.open()) {
-        std::cout << "[receiver] attached existing SHM segment " << SHM_NAME << "\n";
-        return true;
-    }
-    if (shm.create()) {
-        std::cout << "[receiver] created SHM segment " << SHM_NAME << "\n";
-        return true;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        if (shm.open()) {
+            if (attempt > 0)
+                std::cout << "[receiver] attached existing SHM segment " << SHM_NAME
+                          << " after " << attempt << " retries\n";
+            else
+                std::cout << "[receiver] attached existing SHM segment " << SHM_NAME << "\n";
+            return true;
+        }
+        if (shm.create()) {
+            std::cout << "[receiver] created SHM segment " << SHM_NAME << "\n";
+            return true;
+        }
+        ::usleep(20000); // 20ms -- winner is inside ftruncate/memset
     }
     return false;
 }

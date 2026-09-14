@@ -53,6 +53,11 @@ static const char* g_current_test = nullptr;
 
 #define RUN(fn)                                                         \
     do {                                                                \
+        /* Fresh segment per test: create() is O_EXCL (multi-process race */ \
+        /* safety -- see shm_manager.cpp), so a leftover mapping from the */ \
+        /* previous test or a crashed run would make every later create */ \
+        /* fail with EEXIST. Unlinking here keeps tests independent. */   \
+        ::shm_unlink(SHM_NAME);                                           \
         ++g_pass;                                                       \
         fn();                                                           \
     } while(0)

@@ -203,11 +203,25 @@ bool ShmManager::create(uint64_t arena_bytes) {
 
     const uint64_t total_size = compute_total_size(arena_bytes);
 
-    // Open (create) the POSIX shared memory object
-    fd_ = ::shm_open(SHM_NAME, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    // Open (create) the POSIX shared memory object. O_EXCL, never O_TRUNC:
+    // up to three receiver processes start at once and whichever gets here
+    // first creates while the rest must attach. A shared O_TRUNC lets a
+    // late starter truncate the segment out from under a peer that already
+    // mmap'd it -- touching the vanished tail is SIGBUS (exit_code=-7 in
+    // the supervisor log), and concurrent memset/init_header corrupts the
+    // free list even when it doesn't crash. With O_EXCL exactly one
+    // creator wins; losers get EEXIST and fall back to open() (the caller
+    // retries briefly -- the winner may still be inside ftruncate).
+    // Same reason a restarting receiver must never truncate: the segment
+    // outlives any one process by design.
+    fd_ = ::shm_open(SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd_ < 0) {
-        std::cerr << "[ShmManager] shm_open create failed: "
-                  << std::strerror(errno) << "\n";
+        if (errno == EEXIST) {
+            std::cerr << "[ShmManager] segment already exists, attach instead\n";
+        } else {
+            std::cerr << "[ShmManager] shm_open create failed: "
+                      << std::strerror(errno) << "\n";
+        }
         return false;
     }
 
