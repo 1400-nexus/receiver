@@ -125,15 +125,42 @@ int main(int argc, char** argv) {
 
     std::cout << "[receiver] ready\n";
 
-    // session_ids this receiver has already reported ManifestSeen for, so
-    // a Manifest seen repeatedly on the data plane (senders resend it
-    // deliberately, per A's_guide.txt) doesn't spam the manager with
-    // duplicates. file_size itself comes from SessionOpen.file_size now,
-    // not from this map.
-    std::map<std::string, uint64_t> file_size_by_session;
+    // Sessions this receiver has seen a Manifest for, keyed by session_id.
+    // Doubles as the "already sent ManifestSeen" dedup: senders resend the
+    // Manifest deliberately (per A's_guide.txt), and each resend must not
+    // spam the manager with a duplicate ManifestSeen.
+    //
+    // The buffered_datagrams are the fix for the early-data window the live
+    // system proved: senders blast data from t=0 while SessionOpen only
+    // arrives after the ManifestSeen round trip (~70ms, ~123 packets at
+    // 21 Mbps). Dropping pre-open data -- the old behavior -- leaves fewer
+    // than k=200 of n=255 symbols, an unrecoverable stall with zero errors
+    // logged anywhere: UnknownSession, silently. So pre-open DataPackets
+    // wait here (bounded, manifest-known geometry) and are replayed through
+    // the pipeline the moment SessionOpen opens the session. A session that
+    // never opens (bogus id, refused manifest) is bounded by
+    // kMaxBufferedPerSession and evicted by PurgeSession.
+    struct EarlySession {
+        nexus::common::Manifest manifest;
+        struct Datagram {
+            uint32_t block_id;
+            uint32_t symbol_id;
+            std::string payload;
+        };
+        std::vector<Datagram> buffered;
+    };
+    constexpr std::size_t kMaxBufferedPerSession = 8192;
+    std::map<std::string, EarlySession> early_sessions;
 
     nexus::net::Frame frame;        // reused across decode_frame() calls (Phase 8's own convention)
     nexus::rx::RxEnvelope envelope; // reused across parse_incoming() calls
+
+    // TEMPORARY diagnosis counters (issue: data flows, no BlockDecoded).
+    // Rate-limited summary every 5000 datagrams; remove once found.
+    uint64_t dbg_frames = 0, dbg_ok = 0, dbg_bad = 0;
+    uint64_t dbg_registered = 0, dbg_dup = 0, dbg_unknown = 0, dbg_invalid = 0,
+             dbg_exhausted = 0, dbg_decoded = 0;
+    uint64_t dbg_session_open_ok = 0, dbg_session_open_fail = 0;
 
     auto last_heartbeat = std::chrono::steady_clock::now();
 
@@ -153,14 +180,17 @@ int main(int argc, char** argv) {
             std::vector<ReceivedDatagram> batch(RECV_BATCH_SIZE);
             const int n = udp.receive_batch(batch.data());
             for (int i = 0; i < n; ++i) {
+                ++dbg_frames;
                 const auto result = decode_frame(batch[i].data, batch[i].len, &frame);
                 if (result != FrameDecodeResult::Ok) {
                     // bad_magic/crc_fail/unparsable -- ReceiverStats
                     // counters exist for exactly this (rx.proto), not
                     // wired into a periodic report here yet; see
                     // docs/PHASE9_DESIGN.md's open items.
+                    ++dbg_bad;
                     continue;
                 }
+                ++dbg_ok;
 
                 switch (frame.msg_case()) {
                     case nexus::net::Frame::kData: {
@@ -171,15 +201,41 @@ int main(int argc, char** argv) {
                             reinterpret_cast<const uint8_t*>(dp.payload().data()),
                             dp.payload().size(), &decoded_block_id);
                         if (outcome == DataPacketOutcome::BlockDecoded) {
+                            ++dbg_decoded;
                             uds.send(build_block_decoded(dp.session_id(), args->receiver_id,
                                                           {decoded_block_id}));
+                        } else if (outcome == DataPacketOutcome::RegisteredOnly) {
+                            ++dbg_registered;
+                        } else if (outcome == DataPacketOutcome::Duplicate) {
+                            ++dbg_dup;
+                        } else if (outcome == DataPacketOutcome::UnknownSession) {
+                            ++dbg_unknown;
+                            // Pre-open data (see early_sessions): buffer it
+                            // for replay on SessionOpen instead of dropping
+                            // it. Only when the Manifest is known (so the
+                            // session is real) and under the cap.
+                            auto eit = early_sessions.find(dp.session_id());
+                            if (eit != early_sessions.end() &&
+                                eit->second.buffered.size() < kMaxBufferedPerSession) {
+                                EarlySession::Datagram dg;
+                                dg.block_id = dp.block_id();
+                                dg.symbol_id = dp.symbol_id();
+                                dg.payload = dp.payload();
+                                eit->second.buffered.push_back(std::move(dg));
+                            }
+                        } else if (outcome == DataPacketOutcome::InvalidBlockOrSymbol) {
+                            ++dbg_invalid;
+                        } else if (outcome == DataPacketOutcome::ArenaExhausted) {
+                            ++dbg_exhausted;
                         }
                         break;
                     }
                     case nexus::net::Frame::kManifest: {
                         const auto& mf = frame.manifest();
-                        if (!file_size_by_session.count(mf.session_id())) {
-                            file_size_by_session[mf.session_id()] = mf.file_size();
+                        if (early_sessions.find(mf.session_id()) == early_sessions.end()) {
+                            EarlySession es;
+                            es.manifest = mf;
+                            early_sessions.emplace(mf.session_id(), std::move(es));
                             uds.send(build_manifest_seen(args->receiver_id, mf));
                         }
                         break;
@@ -205,8 +261,34 @@ int main(int argc, char** argv) {
                     if (kase == RxEnvelopeCase::SessionOpen) {
                         const auto& so = envelope.session_open();
                         if (!pipeline.handle_session_open(so, so.file_size())) {
+                            ++dbg_session_open_fail;
                             std::cerr << "[receiver] handle_session_open failed for "
                                       << so.session_id() << "\n";
+                        } else {
+                            ++dbg_session_open_ok;
+                            std::cout << "[receiver] session opened "
+                                      << so.session_id() << " blocks="
+                                      << so.total_blocks() << "\n";
+                            // Replay whatever arrived before the session
+                            // opened (see early_sessions): registrations
+                            // that complete a block report it, exactly as
+                            // if the packets had arrived after the open.
+                            auto eit = early_sessions.find(so.session_id());
+                            if (eit != early_sessions.end()) {
+                                for (const auto& dg : eit->second.buffered) {
+                                    uint32_t replayed_block = 0;
+                                    const auto ro = pipeline.handle_data_packet(
+                                        so.session_id(), dg.block_id, dg.symbol_id,
+                                        reinterpret_cast<const uint8_t*>(dg.payload.data()),
+                                        dg.payload.size(), &replayed_block);
+                                    if (ro == DataPacketOutcome::BlockDecoded) {
+                                        uds.send(build_block_decoded(
+                                            so.session_id(), args->receiver_id,
+                                            {replayed_block}));
+                                    }
+                                }
+                                early_sessions.erase(eit);
+                            }
                         }
                     } else if (kase == RxEnvelopeCase::PurgeSession) {
                         // Terminal state reached on the manager's side:
@@ -215,7 +297,7 @@ int main(int argc, char** argv) {
                         // is idempotent and may be re-sent).
                         const auto& ps = envelope.purge_session();
                         pipeline.purge_session(ps.session_id());
-                        file_size_by_session.erase(ps.session_id());
+                        early_sessions.erase(ps.session_id());
                         std::cout << "[receiver] purged session "
                                   << ps.session_id() << " reason="
                                   << ps.reason() << "\n";
@@ -234,10 +316,22 @@ int main(int argc, char** argv) {
         const auto now = std::chrono::steady_clock::now();
         if (now - last_heartbeat >= std::chrono::milliseconds(kHeartbeatIntervalMs)) {
             const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     now.time_since_epoch()).count();
+                                      now.time_since_epoch()).count();
             uds.send(build_heartbeat(static_cast<uint32_t>(::getpid()),
                                       static_cast<uint64_t>(now_ms)));
             last_heartbeat = now;
+            // TEMPORARY diagnosis summary (see counters above).
+            if (dbg_frames > 0) {
+                std::cout << "[receiver] dbg frames=" << dbg_frames << " ok=" << dbg_ok
+                          << " bad=" << dbg_bad << " reg=" << dbg_registered
+                          << " dup=" << dbg_dup << " unknown=" << dbg_unknown
+                          << " invalid=" << dbg_invalid << " exhausted=" << dbg_exhausted
+                          << " decoded=" << dbg_decoded << " open_ok=" << dbg_session_open_ok
+                          << " open_fail=" << dbg_session_open_fail << "\n";
+                dbg_frames = dbg_ok = dbg_bad = 0;
+                dbg_registered = dbg_dup = dbg_unknown = 0;
+                dbg_invalid = dbg_exhausted = dbg_decoded = 0;
+            }
         }
     }
 
