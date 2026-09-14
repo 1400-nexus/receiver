@@ -155,13 +155,6 @@ int main(int argc, char** argv) {
     nexus::net::Frame frame;        // reused across decode_frame() calls (Phase 8's own convention)
     nexus::rx::RxEnvelope envelope; // reused across parse_incoming() calls
 
-    // TEMPORARY diagnosis counters (issue: data flows, no BlockDecoded).
-    // Rate-limited summary every 5000 datagrams; remove once found.
-    uint64_t dbg_frames = 0, dbg_ok = 0, dbg_bad = 0;
-    uint64_t dbg_registered = 0, dbg_dup = 0, dbg_unknown = 0, dbg_invalid = 0,
-             dbg_exhausted = 0, dbg_decoded = 0;
-    uint64_t dbg_session_open_ok = 0, dbg_session_open_fail = 0;
-
     auto last_heartbeat = std::chrono::steady_clock::now();
 
     for (;;) {
@@ -180,17 +173,14 @@ int main(int argc, char** argv) {
             std::vector<ReceivedDatagram> batch(RECV_BATCH_SIZE);
             const int n = udp.receive_batch(batch.data());
             for (int i = 0; i < n; ++i) {
-                ++dbg_frames;
                 const auto result = decode_frame(batch[i].data, batch[i].len, &frame);
                 if (result != FrameDecodeResult::Ok) {
                     // bad_magic/crc_fail/unparsable -- ReceiverStats
                     // counters exist for exactly this (rx.proto), not
                     // wired into a periodic report here yet; see
                     // docs/PHASE9_DESIGN.md's open items.
-                    ++dbg_bad;
                     continue;
                 }
-                ++dbg_ok;
 
                 switch (frame.msg_case()) {
                     case nexus::net::Frame::kData: {
@@ -201,15 +191,9 @@ int main(int argc, char** argv) {
                             reinterpret_cast<const uint8_t*>(dp.payload().data()),
                             dp.payload().size(), &decoded_block_id);
                         if (outcome == DataPacketOutcome::BlockDecoded) {
-                            ++dbg_decoded;
                             uds.send(build_block_decoded(dp.session_id(), args->receiver_id,
                                                           {decoded_block_id}));
-                        } else if (outcome == DataPacketOutcome::RegisteredOnly) {
-                            ++dbg_registered;
-                        } else if (outcome == DataPacketOutcome::Duplicate) {
-                            ++dbg_dup;
                         } else if (outcome == DataPacketOutcome::UnknownSession) {
-                            ++dbg_unknown;
                             // Pre-open data (see early_sessions): buffer it
                             // for replay on SessionOpen instead of dropping
                             // it. Only when the Manifest is known (so the
@@ -223,10 +207,6 @@ int main(int argc, char** argv) {
                                 dg.payload = dp.payload();
                                 eit->second.buffered.push_back(std::move(dg));
                             }
-                        } else if (outcome == DataPacketOutcome::InvalidBlockOrSymbol) {
-                            ++dbg_invalid;
-                        } else if (outcome == DataPacketOutcome::ArenaExhausted) {
-                            ++dbg_exhausted;
                         }
                         break;
                     }
@@ -261,14 +241,9 @@ int main(int argc, char** argv) {
                     if (kase == RxEnvelopeCase::SessionOpen) {
                         const auto& so = envelope.session_open();
                         if (!pipeline.handle_session_open(so, so.file_size())) {
-                            ++dbg_session_open_fail;
                             std::cerr << "[receiver] handle_session_open failed for "
                                       << so.session_id() << "\n";
                         } else {
-                            ++dbg_session_open_ok;
-                            std::cout << "[receiver] session opened "
-                                      << so.session_id() << " blocks="
-                                      << so.total_blocks() << "\n";
                             // Replay whatever arrived before the session
                             // opened (see early_sessions): registrations
                             // that complete a block report it, exactly as
@@ -320,18 +295,6 @@ int main(int argc, char** argv) {
             uds.send(build_heartbeat(static_cast<uint32_t>(::getpid()),
                                       static_cast<uint64_t>(now_ms)));
             last_heartbeat = now;
-            // TEMPORARY diagnosis summary (see counters above).
-            if (dbg_frames > 0) {
-                std::cout << "[receiver] dbg frames=" << dbg_frames << " ok=" << dbg_ok
-                          << " bad=" << dbg_bad << " reg=" << dbg_registered
-                          << " dup=" << dbg_dup << " unknown=" << dbg_unknown
-                          << " invalid=" << dbg_invalid << " exhausted=" << dbg_exhausted
-                          << " decoded=" << dbg_decoded << " open_ok=" << dbg_session_open_ok
-                          << " open_fail=" << dbg_session_open_fail << "\n";
-                dbg_frames = dbg_ok = dbg_bad = 0;
-                dbg_registered = dbg_dup = dbg_unknown = 0;
-                dbg_invalid = dbg_exhausted = dbg_decoded = 0;
-            }
         }
     }
 
