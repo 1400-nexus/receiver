@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -54,7 +55,11 @@ static const char* g_current_test = nullptr;
 // =============================================================================
 
 static std::string test_socket_path(const char* name) {
-    return std::string("/home/elkanasassi/.claude/jobs/cac5291e/tmp/uds_test_") + name + ".sock";
+    // Socket files go under $TMPDIR (dev.sh sets TMPDIR=/tmp in the
+    // container); never a hardcoded home directory, which does not exist
+    // on other machines or inside containers.
+    const char* tmpdir = std::getenv("TMPDIR");
+    return std::string(tmpdir ? tmpdir : "/tmp") + "/uds_test_" + name + ".sock";
 }
 
 // Binds and listens; returns the listening fd, or -1 on failure.

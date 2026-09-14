@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -53,7 +54,11 @@ static const char* g_current_test = nullptr;
 // Every test gets its own file under the job tmp dir (not /tmp -- shared
 // across parallel background jobs) so tests never collide with each other.
 static std::string test_file_path(const char* name) {
-    return std::string("/home/elkanasassi/.claude/jobs/cac5291e/tmp/bw_test_") + name;
+    // Fixture files go under $TMPDIR (dev.sh sets TMPDIR=/tmp in the
+    // container); never a hardcoded home directory, which does not exist
+    // on other machines or inside containers.
+    const char* tmpdir = std::getenv("TMPDIR");
+    return std::string(tmpdir ? tmpdir : "/tmp") + "/bw_test_" + name;
 }
 
 // Creates a file of exactly `size` bytes, all zero -- mirrors what

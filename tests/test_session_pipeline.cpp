@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <random>
@@ -53,7 +54,11 @@ static const char* g_current_test = nullptr;
 // =============================================================================
 
 static std::string test_file_path(const char* name) {
-    return std::string("/home/elkanasassi/.claude/jobs/cac5291e/tmp/sp_test_") + name;
+    // Fixture files go under $TMPDIR (dev.sh sets TMPDIR=/tmp in the
+    // container); never a hardcoded home directory, which does not exist
+    // on other machines or inside containers.
+    const char* tmpdir = std::getenv("TMPDIR");
+    return std::string(tmpdir ? tmpdir : "/tmp") + "/sp_test_" + name;
 }
 
 static void make_fallocated_file(const std::string& path, uint64_t size) {
