@@ -162,6 +162,44 @@ static void test_session_open_fails_on_missing_file() {
     ASSERT_TRUE(!pipeline.handle_session_open(so, 280000));
 }
 
+static void test_purge_session_drops_context_and_unknown_id_is_noop() {
+    TEST(purge_session_drops_context_and_unknown_id_is_noop);
+
+    const std::string path = test_file_path("purge.bin");
+    make_fallocated_file(path, 1400 * 200);
+
+    ShmManager shm;
+    ASSERT_TRUE(shm.create(SLOT_SIZE * 100));
+    SessionPipeline pipeline(shm);
+
+    auto so = make_session_open("sess-purge", path, 1, 200, 255, 1400);
+    ASSERT_TRUE(pipeline.handle_session_open(so, 1400ull * 200));
+
+    // Unknown id first: must not fail or disturb the open session.
+    pipeline.purge_session("never-opened");
+
+    std::vector<uint8_t> payload(1400, 0xAB);
+    uint32_t decoded_id = 0;
+    ASSERT_TRUE(pipeline.handle_data_packet("sess-purge", 0, 0,
+                                            payload.data(), payload.size(), &decoded_id)
+                == DataPacketOutcome::RegisteredOnly);
+
+    pipeline.purge_session("sess-purge");
+
+    // Context is gone: packets now report UnknownSession, and a second
+    // purge is still a no-op.
+    ASSERT_TRUE(pipeline.handle_data_packet("sess-purge", 0, 1,
+                                            payload.data(), payload.size(), &decoded_id)
+                == DataPacketOutcome::UnknownSession);
+    pipeline.purge_session("sess-purge");
+
+    // A fresh SessionOpen reopens the session afterwards.
+    ASSERT_TRUE(pipeline.handle_session_open(so, 1400ull * 200));
+    ASSERT_TRUE(pipeline.handle_data_packet("sess-purge", 0, 1,
+                                            payload.data(), payload.size(), &decoded_id)
+                == DataPacketOutcome::RegisteredOnly);
+}
+
 static void test_data_packet_unknown_session() {
     TEST(data_packet_unknown_session);
 
@@ -425,6 +463,7 @@ int main() {
 
     RUN(test_session_open_creates_context_and_is_idempotent);
     RUN(test_session_open_fails_on_missing_file);
+    RUN(test_purge_session_drops_context_and_unknown_id_is_noop);
     RUN(test_data_packet_unknown_session);
     RUN(test_data_packet_invalid_symbol_and_block);
     RUN(test_single_registration_then_duplicate);

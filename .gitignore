@@ -1,6 +1,8 @@
 # --- Compilation & Build ---
 # We use 'build' as the standard directory for CMake
 build/
+build-linux/
+cmake-build-*/
 bin/
 lib/
 out/

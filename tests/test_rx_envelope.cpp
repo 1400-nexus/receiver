@@ -168,6 +168,7 @@ static void test_parse_incoming_session_open() {
     so->set_block_bytes(1400);
     so->set_block_table_offset(4160);
     so->set_bitmap_offset(4640);
+    so->set_file_size(2800000);
     std::string raw;
     in.SerializeToString(&raw);
 
@@ -177,7 +178,8 @@ static void test_parse_incoming_session_open() {
     ASSERT_TRUE(kase == RxEnvelopeCase::SessionOpen);
     ASSERT_TRUE(out.session_open().session_id() == "sess-open-1");
     ASSERT_TRUE(out.session_open().dest_path() == "/staging/sess-open-1/file.bin");
-    ASSERT_EQ(out.session_open().k(), 200u);
+    ASSERT_TRUE(out.session_open().k() == 200u);
+    ASSERT_TRUE(out.session_open().file_size() == 2800000u);
 }
 
 static void test_parse_incoming_purge_session() {
@@ -186,7 +188,7 @@ static void test_parse_incoming_purge_session() {
     nexus::rx::RxEnvelope in;
     auto* ps = in.mutable_purge_session();
     ps->set_session_id("sess-purge-1");
-    ps->set_reason("manifest_hash_mismatch");
+    ps->set_reason(nexus::rx::PURGE_REASON_QUARANTINED);
     std::string raw;
     in.SerializeToString(&raw);
 
@@ -195,7 +197,7 @@ static void test_parse_incoming_purge_session() {
     ASSERT_TRUE(parse_incoming(raw, &out, &kase));
     ASSERT_TRUE(kase == RxEnvelopeCase::PurgeSession);
     ASSERT_TRUE(out.purge_session().session_id() == "sess-purge-1");
-    ASSERT_TRUE(out.purge_session().reason() == "manifest_hash_mismatch");
+    ASSERT_TRUE(out.purge_session().reason() == nexus::rx::PURGE_REASON_QUARANTINED);
 }
 
 static void test_parse_incoming_config() {

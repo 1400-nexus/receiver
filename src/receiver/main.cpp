@@ -17,18 +17,12 @@
 // process exists would race against exactly the liveness check that
 // decides whether the manager adopts or reinitializes it.
 //
-// Genuine, flagged (not silently worked around) gap: `SessionOpen` (M->R)
-// does not carry `file_size` -- only the `Manifest` this receiver would
-// have seen directly on the UDP data plane does. A receiver that (re)joins
-// after another receiver already reported that session's ManifestSeen
-// gets a SessionOpen for a session it never saw the Manifest for, and has
-// no correct way to learn file_size. Rather than guess (an overestimate
-// would corrupt BlockWriter's mmap sizing/clipping; RECEIVER_CONTRACT.md
-// §5 property 3 already burned this project once on a similar "read the
-// wrong wire field" mistake), this receiver simply refuses to open such a
-// session and logs loudly -- see the SessionOpen handling below. Worth
-// raising with the team as a real, unresolved contract gap, not treated
-// as solved here.
+// SessionOpen carries everything this receiver needs, including
+// `file_size` (rx.proto field 9, verbatim Manifest.file_size) -- the path
+// a receiver that (re)joins after another receiver already reported that
+// session's ManifestSeen depends on, since it never saw the Manifest
+// itself. (Before field 9, such a session had to be refused for lack of
+// a correct file_size; that gap is closed, not worked around.)
 #include "receiver/frame_dispatcher.hpp"
 #include "receiver/receiver_args.hpp"
 #include "receiver/rx_envelope.hpp"
@@ -119,12 +113,11 @@ int main(int argc, char** argv) {
 
     std::cout << "[receiver] ready\n";
 
-    // file_size learned from each session's Manifest, keyed by
-    // session_id -- SessionOpen doesn't carry it (see the module comment
-    // above). Also doubles as this receiver's own "have I already sent
-    // ManifestSeen for this session" dedup, so a Manifest seen repeatedly
-    // on the data plane (senders resend it deliberately, per A's_guide.txt)
-    // doesn't spam the manager with duplicate ManifestSeen reports.
+    // session_ids this receiver has already reported ManifestSeen for, so
+    // a Manifest seen repeatedly on the data plane (senders resend it
+    // deliberately, per A's_guide.txt) doesn't spam the manager with
+    // duplicates. file_size itself comes from SessionOpen.file_size now,
+    // not from this map.
     std::map<std::string, uint64_t> file_size_by_session;
 
     nexus::net::Frame frame;        // reused across decode_frame() calls (Phase 8's own convention)
@@ -199,26 +192,25 @@ int main(int argc, char** argv) {
                 if (parse_incoming(*raw, &envelope, &kase)) {
                     if (kase == RxEnvelopeCase::SessionOpen) {
                         const auto& so = envelope.session_open();
-                        auto it = file_size_by_session.find(so.session_id());
-                        if (it == file_size_by_session.end()) {
-                            // See the module comment: a genuine, unsolved
-                            // contract gap, not guessed at here.
-                            std::cerr << "[receiver] SessionOpen for "
-                                      << so.session_id()
-                                      << " but no Manifest seen by this "
-                                         "receiver -- file_size unknown, "
-                                         "refusing to open (known gap, see "
-                                         "main.cpp's module comment)\n";
-                        } else if (!pipeline.handle_session_open(so, it->second)) {
+                        if (!pipeline.handle_session_open(so, so.file_size())) {
                             std::cerr << "[receiver] handle_session_open failed for "
                                       << so.session_id() << "\n";
                         }
+                    } else if (kase == RxEnvelopeCase::PurgeSession) {
+                        // Terminal state reached on the manager's side:
+                        // drop this process's decode context for the
+                        // session (unknown id is a no-op -- PurgeSession
+                        // is idempotent and may be re-sent).
+                        const auto& ps = envelope.purge_session();
+                        pipeline.purge_session(ps.session_id());
+                        file_size_by_session.erase(ps.session_id());
+                        std::cout << "[receiver] purged session "
+                                  << ps.session_id() << " reason="
+                                  << ps.reason() << "\n";
                     }
                     // Config: unused -- this segment is entirely
                     // receiver-owned, no need for session_manager's
-                    // shm_name (docs/PHASE9_DESIGN.md). PurgeSession:
-                    // semantics genuinely undecided on both sides
-                    // (docs/ANSWERS_FROM_C.md §6) -- not guessed at.
+                    // shm_name (docs/PHASE9_DESIGN.md).
                     // Heartbeat/receiver-originated cases arriving here
                     // would be a real protocol-direction bug; nothing
                     // acts on them either, deliberately.

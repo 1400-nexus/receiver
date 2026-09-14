@@ -39,6 +39,10 @@ bool SessionPipeline::handle_session_open(const nexus::rx::SessionOpen& msg, uin
     return true;
 }
 
+void SessionPipeline::purge_session(const std::string& session_id) {
+    sessions_.erase(session_id);
+}
+
 DataPacketOutcome SessionPipeline::handle_data_packet(const std::string& session_id,
                                                         uint32_t block_id, uint32_t symbol_id,
                                                         const uint8_t* payload, size_t payload_len,

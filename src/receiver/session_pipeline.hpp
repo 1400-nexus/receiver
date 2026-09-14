@@ -57,18 +57,26 @@ public:
     // call more than once for the same session_id; a repeat is a no-op
     // that returns true immediately without touching anything.
     //
-    // `file_size` is NOT carried by SessionOpen (checked: rx.proto's
-    // SessionOpen has no such field) -- it comes from the Manifest this
-    // receiver already saw directly on the UDP data plane (the same
-    // Manifest that triggered sending ManifestSeen in the first place).
-    // The caller is responsible for having that value on hand; this
-    // function doesn't invent a way to get it from SessionOpen alone.
+    // `file_size` comes from SessionOpen.file_size itself (rx.proto field
+    // 9, verbatim Manifest.file_size) -- the path a late joiner that never
+    // saw the Manifest depends on. The caller passes msg.file_size();
+    // this function takes it as a parameter (rather than reading the
+    // message) so the caller's manifest cache stays the single place that
+    // decides which value is authoritative.
     //
     // Returns false only on a real failure: ShmManager::open_session()
     // exhausted (MAX_SESSIONS) or rejected (total_blocks over this
     // segment's MAX_BLOCKS_PER_SESSION capacity), or BlockWriter::open()
     // failing (missing/undersized destination file, mmap failure).
     bool handle_session_open(const nexus::rx::SessionOpen& msg, uint64_t file_size);
+
+    // Handles an inbound PurgeSession: drops this process's decode context
+    // for the session (the BlockWriter destructor closes/munmaps the
+    // destination file; arena slots for decoded blocks were already freed
+    // per block). Unknown session_id is a no-op, not an error -- PurgeSession
+    // is idempotent and may be re-sent. After this, DataPackets for the
+    // session report UnknownSession until a fresh SessionOpen reopens it.
+    void purge_session(const std::string& session_id);
 
     // Handles one received, wire-validated, parsed DataPacket (its three
     // routing fields plus the raw symbol payload). `payload_len` must
