@@ -210,6 +210,199 @@ static void test_purge_session_drops_context_and_unknown_id_is_noop() {
                 == DataPacketOutcome::RegisteredOnly);
 }
 
+static void test_purge_session_frees_undecoded_slots_and_releases_entry() {
+    TEST(purge_session_frees_undecoded_slots_and_releases_entry);
+
+    // Regression for the 750MB/1GB arena wedge: symbols registered into
+    // blocks that never reach k were leaked permanently (slots freed
+    // only on successful decode), and the SHM session entry stayed OPEN.
+    const uint32_t k = 4, n = 6, symbol_bytes = 16;
+    const uint64_t file_size = uint64_t(k) * symbol_bytes * 2; // total_blocks = 2
+    const std::string path = test_file_path("purge_leak.bin");
+    make_fallocated_file(path, file_size);
+
+    ShmManager shm;
+    ASSERT_TRUE(shm.create(SLOT_SIZE * 32));
+    SessionPipeline pipeline(shm);
+
+    auto so = make_session_open("sess-leak", path, 2, k, n, symbol_bytes);
+    ASSERT_TRUE(pipeline.handle_session_open(so, file_size));
+    ASSERT_EQ(shm.used_slot_count(), 0u);
+
+    // 3 symbols in each of 2 blocks -- all below k, so nothing decodes
+    // and all 6 slots stay held.
+    std::vector<uint8_t> payload(symbol_bytes, 0xAB);
+    uint32_t decoded_id = 0;
+    for (uint32_t b = 0; b < 2; ++b) {
+        for (uint32_t s = 0; s < 3; ++s) {
+            ASSERT_TRUE(pipeline.handle_data_packet("sess-leak", b, s,
+                                                     payload.data(), payload.size(),
+                                                     &decoded_id)
+                        == DataPacketOutcome::RegisteredOnly);
+        }
+    }
+    ASSERT_EQ(shm.used_slot_count(), 6u);
+
+    pipeline.purge_session("sess-leak");
+
+    // Every held slot reclaimed, SHM entry released.
+    ASSERT_EQ(shm.used_slot_count(), 0u);
+    ASSERT_TRUE(shm.find_session("sess-leak") == nullptr);
+
+    // Second purge is a no-op, not a double-free of the same slots.
+    pipeline.purge_session("sess-leak");
+    ASSERT_EQ(shm.used_slot_count(), 0u);
+
+    // Session slot reusable: a fresh SessionOpen for the same id works
+    // and registers again.
+    ASSERT_TRUE(pipeline.handle_session_open(so, file_size));
+    ASSERT_TRUE(pipeline.handle_data_packet("sess-leak", 0, 0,
+                                             payload.data(), payload.size(), &decoded_id)
+                == DataPacketOutcome::RegisteredOnly);
+    ASSERT_EQ(shm.used_slot_count(), 1u);
+}
+
+static void test_purge_recovers_exhausted_arena() {
+    TEST(purge_recovers_exhausted_arena);
+
+    // Tiny arena: 8 slots. Fill with undecoded symbols, prove the 9th
+    // is refused, then prove a purge restores capacity -- the exact
+    // wedged-receiver scenario at small scale. k=8 keeps every partial
+    // fill below the decode threshold (garbage payloads would otherwise
+    // "decode" at seen>=k and free their slots mid-test).
+    const uint32_t k = 8, n = 10, symbol_bytes = 16;
+    const uint64_t file_size = uint64_t(k) * symbol_bytes * 2;
+    const std::string path = test_file_path("purge_exhaust.bin");
+    make_fallocated_file(path, file_size);
+
+    ShmManager shm;
+    ASSERT_TRUE(shm.create(SLOT_SIZE * 8));
+    SessionPipeline pipeline(shm);
+
+    auto so = make_session_open("sess-exhaust", path, 2, k, n, symbol_bytes);
+    ASSERT_TRUE(pipeline.handle_session_open(so, file_size));
+
+    std::vector<uint8_t> payload(symbol_bytes, 0xCD);
+    uint32_t decoded_id = 0;
+    for (uint32_t s = 0; s < 7; ++s) { // block 0: symbols 0..6 (7 < k, no decode)
+        ASSERT_TRUE(pipeline.handle_data_packet("sess-exhaust", 0, s,
+                                                 payload.data(), payload.size(),
+                                                 &decoded_id)
+                    == DataPacketOutcome::RegisteredOnly);
+    }
+    // block 1: symbol 0 (arena now full at 8)
+    ASSERT_TRUE(pipeline.handle_data_packet("sess-exhaust", 1, 0,
+                                             payload.data(), payload.size(),
+                                             &decoded_id)
+                == DataPacketOutcome::RegisteredOnly);
+    ASSERT_EQ(shm.used_slot_count(), 8u);
+    ASSERT_TRUE(pipeline.handle_data_packet("sess-exhaust", 1, 2,
+                                             payload.data(), payload.size(), &decoded_id)
+                == DataPacketOutcome::ArenaExhausted);
+
+    pipeline.purge_session("sess-exhaust");
+    ASSERT_EQ(shm.used_slot_count(), 0u);
+
+    ASSERT_TRUE(pipeline.handle_session_open(so, file_size));
+    ASSERT_TRUE(pipeline.handle_data_packet("sess-exhaust", 1, 2,
+                                             payload.data(), payload.size(), &decoded_id)
+                == DataPacketOutcome::RegisteredOnly);
+}
+
+static void test_purge_after_decode_no_double_free() {
+    TEST(purge_after_decode_no_double_free);
+
+    // A session with one decoded block + one partial block: purge must
+    // free only the partial block's slots. The decoded block's slots
+    // were already freed (and their links cleared) at decode time --
+    // freeing them again would corrupt the free list.
+    const uint32_t k = 4, n = 6, symbol_bytes = 16;
+    const uint64_t file_size = uint64_t(k) * symbol_bytes * 2; // total_blocks = 2
+    const std::string path = test_file_path("purge_decoded.bin");
+    make_fallocated_file(path, file_size);
+
+    ShmManager shm;
+    ASSERT_TRUE(shm.create(SLOT_SIZE * 32));
+    SessionPipeline pipeline(shm);
+
+    auto so = make_session_open("sess-mixed", path, 2, k, n, symbol_bytes);
+    ASSERT_TRUE(pipeline.handle_session_open(so, file_size));
+
+    EncodedBlock block0 = make_encoded_block(k, n, symbol_bytes, 11);
+    uint32_t decoded_id = 0;
+    DataPacketOutcome last = DataPacketOutcome::RegisteredOnly;
+    for (uint32_t s = 0; s < k; ++s) {
+        last = pipeline.handle_data_packet("sess-mixed", 0, s,
+                                            block0.symbols[s].data(), symbol_bytes,
+                                            &decoded_id);
+    }
+    ASSERT_TRUE(last == DataPacketOutcome::BlockDecoded);
+    ASSERT_EQ(shm.used_slot_count(), 0u); // decode freed its own slots
+
+    // 2 symbols in block 1, below k -- 2 slots held.
+    std::vector<uint8_t> payload(symbol_bytes, 0xAB);
+    for (uint32_t s = 0; s < 2; ++s) {
+        ASSERT_TRUE(pipeline.handle_data_packet("sess-mixed", 1, s,
+                                                 payload.data(), payload.size(),
+                                                 &decoded_id)
+                    == DataPacketOutcome::RegisteredOnly);
+    }
+    ASSERT_EQ(shm.used_slot_count(), 2u);
+
+    pipeline.purge_session("sess-mixed");
+    ASSERT_EQ(shm.used_slot_count(), 0u);
+
+    // Arena still healthy: reopen and allocate the full sweep size again.
+    ASSERT_TRUE(pipeline.handle_session_open(so, file_size));
+    for (uint32_t s = 0; s < 2; ++s) {
+        ASSERT_TRUE(pipeline.handle_data_packet("sess-mixed", 1, s,
+                                                 payload.data(), payload.size(),
+                                                 &decoded_id)
+                    == DataPacketOutcome::RegisteredOnly);
+    }
+    ASSERT_EQ(shm.used_slot_count(), 2u);
+}
+
+static void test_late_symbol_after_complete_holds_no_slot() {
+    TEST(late_symbol_after_complete_holds_no_slot);
+
+    // Post-decode symbols (k..n-1 arriving after DECODE_COMPLETE) must
+    // not allocate arena slots -- the block is already durably on disk.
+    // Without the COMPLETE short-circuit each leaks one slot until
+    // purge (up to n-k=55 per block).
+    const uint32_t k = 4, n = 6, symbol_bytes = 16;
+    const uint64_t file_size = uint64_t(k) * symbol_bytes; // total_blocks = 1
+    const std::string path = test_file_path("late_symbol.bin");
+    make_fallocated_file(path, file_size);
+
+    ShmManager shm;
+    ASSERT_TRUE(shm.create(SLOT_SIZE * 32));
+    SessionPipeline pipeline(shm);
+
+    auto so = make_session_open("sess-late", path, 1, k, n, symbol_bytes);
+    ASSERT_TRUE(pipeline.handle_session_open(so, file_size));
+
+    EncodedBlock block = make_encoded_block(k, n, symbol_bytes, 12);
+    uint32_t decoded_id = 0;
+    DataPacketOutcome last = DataPacketOutcome::RegisteredOnly;
+    for (uint32_t s = 0; s < k; ++s) {
+        last = pipeline.handle_data_packet("sess-late", 0, s,
+                                            block.symbols[s].data(), symbol_bytes,
+                                            &decoded_id);
+    }
+    ASSERT_TRUE(last == DataPacketOutcome::BlockDecoded);
+    ASSERT_EQ(shm.used_slot_count(), 0u);
+
+    // Late parity symbols for the completed block: no slot growth.
+    for (uint32_t s = k; s < n; ++s) {
+        ASSERT_TRUE(pipeline.handle_data_packet("sess-late", 0, s,
+                                                 block.symbols[s].data(), symbol_bytes,
+                                                 &decoded_id)
+                    == DataPacketOutcome::Duplicate);
+    }
+    ASSERT_EQ(shm.used_slot_count(), 0u);
+}
+
 static void test_data_packet_unknown_session() {
     TEST(data_packet_unknown_session);
 
@@ -474,6 +667,10 @@ int main() {
     RUN(test_session_open_creates_context_and_is_idempotent);
     RUN(test_session_open_fails_on_missing_file);
     RUN(test_purge_session_drops_context_and_unknown_id_is_noop);
+    RUN(test_purge_session_frees_undecoded_slots_and_releases_entry);
+    RUN(test_purge_recovers_exhausted_arena);
+    RUN(test_purge_after_decode_no_double_free);
+    RUN(test_late_symbol_after_complete_holds_no_slot);
     RUN(test_data_packet_unknown_session);
     RUN(test_data_packet_invalid_symbol_and_block);
     RUN(test_single_registration_then_duplicate);

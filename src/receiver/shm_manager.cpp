@@ -179,6 +179,10 @@ uint32_t  BlockView::slot_idx(uint32_t sid) const {
     return (sid < MAX_N) ? e_.slot_idx[sid] : SLOT_IDX_FREE;
 }
 
+void BlockView::clear_slot(uint32_t sid) {
+    if (sid < MAX_N) e_.slot_idx[sid] = SLOT_IDX_FREE;
+}
+
 // =============================================================================
 // ShmManager
 // =============================================================================
@@ -486,6 +490,72 @@ std::optional<uint32_t> ShmManager::open_session(const char* session_id,
 
     header_->session_open_lock.store(0, std::memory_order_release);
     return result; // nullopt only if MAX_SESSIONS was exhausted
+}
+
+bool ShmManager::close_session(const char* session_id) {
+    if (!header_ || !session_table_ || !session_id) return false;
+
+    // Claim under the same lock open_session() uses, so a concurrent open
+    // cannot slip a new entry for this id between our find and our state
+    // transition. The lock's acquire pairs with open's unlock release, so
+    // the entry fields read below are safe once claimed.
+    uint32_t unlocked = 0;
+    while (!header_->session_open_lock.compare_exchange_weak(
+               unlocked, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+        unlocked = 0; // compare_exchange_weak may have written 1 into it on failure; reset before retry
+    }
+
+    uint32_t idx = MAX_SESSIONS; // sentinel: not found
+    for (uint32_t i = 0; i < MAX_SESSIONS; ++i) {
+        if (session_table_[i].state.load(std::memory_order_relaxed) == SESSION_STATE_OPEN &&
+            std::strncmp(session_table_[i].session_id, session_id, 63) == 0) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx != MAX_SESSIONS) {
+        // Single-winner claim. Under the lock no other close/open can be
+        // here for this entry, so a plain release-store suffices; every
+        // later closer sees non-OPEN and skips the sweep. From here on,
+        // block_entry()/find_session() (OPEN-only) shut out new data
+        // packets for this session -- no new alloc_slot() through them.
+        session_table_[idx].state.store(SESSION_STATE_CLOSING, std::memory_order_release);
+    }
+    header_->session_open_lock.store(0, std::memory_order_release);
+
+    if (idx == MAX_SESSIONS) return false; // unknown id or already closed -- no-op
+
+    // Sweep WITHOUT the lock: touching up to total_blocks x n slots can
+    // take milliseconds and must not stall open_session() for unrelated
+    // sessions behind the global spinlock.
+    SessionEntry& se = session_table_[idx];
+    const uint32_t n = se.n <= MAX_N ? se.n : MAX_N;
+    uint32_t total_blocks = se.total_blocks;
+    if (total_blocks > MAX_BLOCKS_PER_SESSION) total_blocks = MAX_BLOCKS_PER_SESSION;
+    BlockEntry* table = reinterpret_cast<BlockEntry*>(
+        reinterpret_cast<uint8_t*>(base_) + se.block_table_offset);
+
+    for (uint32_t b = 0; b < total_blocks; ++b) {
+        BlockEntry& e = table[b];
+        for (uint32_t s = 0; s < n; ++s) {
+            const uint32_t word_idx = s / 64;
+            const uint64_t bit = uint64_t(1) << (s % 64);
+            if ((e.present_mask[word_idx].load(std::memory_order_acquire) & bit) != 0) {
+                const uint32_t slot = e.slot_idx[s];
+                if (slot != SLOT_IDX_FREE) free_slot(slot);
+            }
+        }
+    }
+
+    // Reset the entry's block-table extent (same memset-0 precedent as
+    // open_session(); reads are present-bit-gated so zeroed slot_idx is
+    // safe), then mark links explicitly FREE so no stale slot 0 shows.
+    std::memset(table, 0, uint64_t(total_blocks) * sizeof(BlockEntry));
+    for (uint32_t b = 0; b < total_blocks; ++b) {
+        for (uint32_t s = 0; s < n; ++s) table[b].slot_idx[s] = SLOT_IDX_FREE;
+    }
+    se.state.store(SESSION_STATE_EMPTY, std::memory_order_release);
+    return true;
 }
 
 BlockEntry* ShmManager::block_entry(uint32_t session_idx, uint32_t block_id) {

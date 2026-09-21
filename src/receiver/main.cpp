@@ -155,6 +155,14 @@ int main(int argc, char** argv) {
     nexus::net::Frame frame;        // reused across decode_frame() calls (Phase 8's own convention)
     nexus::rx::RxEnvelope envelope; // reused across parse_incoming() calls
 
+    // Cumulative ReceiverStats counters (rx.proto) -- reported to the
+    // manager alongside every heartbeat. InvalidBlockOrSymbol has no
+    // proto bucket and stays uncounted; kernel_drops has no source here
+    // (recvmmsg overflow is invisible to us) and stays 0.
+    uint64_t stat_pkts_ok = 0, stat_crc_fail = 0, stat_bad_magic = 0,
+             stat_unparsable = 0, stat_duplicates = 0, stat_no_session = 0,
+             stat_arena_exhausted = 0;
+
     auto last_heartbeat = std::chrono::steady_clock::now();
 
     for (;;) {
@@ -175,12 +183,15 @@ int main(int argc, char** argv) {
             for (int i = 0; i < n; ++i) {
                 const auto result = decode_frame(batch[i].data, batch[i].len, &frame);
                 if (result != FrameDecodeResult::Ok) {
-                    // bad_magic/crc_fail/unparsable -- ReceiverStats
-                    // counters exist for exactly this (rx.proto), not
-                    // wired into a periodic report here yet; see
-                    // docs/PHASE9_DESIGN.md's open items.
+                    switch (result) {
+                        case FrameDecodeResult::BadMagic: ++stat_bad_magic; break;
+                        case FrameDecodeResult::CrcFail: ++stat_crc_fail; break;
+                        case FrameDecodeResult::Unparsable: ++stat_unparsable; break;
+                        case FrameDecodeResult::Ok: break; // unreachable
+                    }
                     continue;
                 }
+                ++stat_pkts_ok; // one validated frame (Data/Manifest/End alike)
 
                 switch (frame.msg_case()) {
                     case nexus::net::Frame::kData: {
@@ -190,6 +201,16 @@ int main(int argc, char** argv) {
                             dp.session_id(), dp.block_id(), dp.symbol_id(),
                             reinterpret_cast<const uint8_t*>(dp.payload().data()),
                             dp.payload().size(), &decoded_block_id);
+                        // pkts_ok already counted at frame validation above;
+                        // only the non-ok outcome buckets are noted here.
+                        switch (outcome) {
+                            case DataPacketOutcome::Duplicate: ++stat_duplicates; break;
+                            case DataPacketOutcome::UnknownSession: ++stat_no_session; break;
+                            case DataPacketOutcome::ArenaExhausted: ++stat_arena_exhausted; break;
+                            case DataPacketOutcome::RegisteredOnly:
+                            case DataPacketOutcome::BlockDecoded:
+                            case DataPacketOutcome::InvalidBlockOrSymbol: break;
+                        }
                         if (outcome == DataPacketOutcome::BlockDecoded) {
                             uds.send(build_block_decoded(dp.session_id(), args->receiver_id,
                                                           {decoded_block_id}));
@@ -256,6 +277,14 @@ int main(int argc, char** argv) {
                                         so.session_id(), dg.block_id, dg.symbol_id,
                                         reinterpret_cast<const uint8_t*>(dg.payload.data()),
                                         dg.payload.size(), &replayed_block);
+                                    switch (ro) {
+                                        case DataPacketOutcome::Duplicate: ++stat_duplicates; break;
+                                        case DataPacketOutcome::ArenaExhausted: ++stat_arena_exhausted; break;
+                                        case DataPacketOutcome::RegisteredOnly:
+                                        case DataPacketOutcome::BlockDecoded:
+                                        case DataPacketOutcome::UnknownSession:
+                                        case DataPacketOutcome::InvalidBlockOrSymbol: break;
+                                    }
                                     if (ro == DataPacketOutcome::BlockDecoded) {
                                         uds.send(build_block_decoded(
                                             so.session_id(), args->receiver_id,
@@ -287,13 +316,26 @@ int main(int argc, char** argv) {
             }
         }
 
-        // --- Periodic heartbeat -------------------------------------------
+        // --- Periodic heartbeat + stats -------------------------------------
         const auto now = std::chrono::steady_clock::now();
         if (now - last_heartbeat >= std::chrono::milliseconds(kHeartbeatIntervalMs)) {
             const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                      now.time_since_epoch()).count();
+                                       now.time_since_epoch()).count();
             uds.send(build_heartbeat(static_cast<uint32_t>(::getpid()),
                                       static_cast<uint64_t>(now_ms)));
+            nexus::rx::ReceiverStats stats;
+            stats.set_receiver_id(args->receiver_id);
+            stats.set_pkts_ok(stat_pkts_ok);
+            stats.set_crc_fail(stat_crc_fail);
+            stats.set_bad_magic(stat_bad_magic);
+            stats.set_unparsable(stat_unparsable);
+            stats.set_duplicates(stat_duplicates);
+            stats.set_no_session(stat_no_session);
+            stats.set_arena_exhausted(stat_arena_exhausted);
+            stats.set_kernel_drops(0); // no source: recvmmsg overflow is invisible here
+            stats.set_arena_high_water_pct(
+                static_cast<uint32_t>(shm.high_water_used_pct()));
+            uds.send(build_receiver_stats(stats));
             last_heartbeat = now;
         }
     }

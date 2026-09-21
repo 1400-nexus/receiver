@@ -447,6 +447,15 @@ public:
 
     uint32_t    slot_idx(uint32_t symbol_id) const;
 
+    // Release a slot link after its bytes were freed (decode path). Sets
+    // slot_idx[sid] back to SLOT_IDX_FREE while leaving the presence bit
+    // set as history. This is what makes the purge sweep's
+    // `slot != SLOT_IDX_FREE` guard actually work: without it, a decoded
+    // block's already-freed slots would be freed a second time at purge
+    // (free-list corruption). Only the decode-claim winner calls this,
+    // for slots its own decode just freed.
+    void        clear_slot(uint32_t symbol_id);
+
 private:
     BlockEntry& e_;
 };
@@ -528,6 +537,24 @@ public:
                                           uint32_t total_blocks,
                                           uint64_t file_size,
                                           const char* dest_path);
+
+    // Releases a session's SHM entry and reclaims every arena slot its
+    // undecoded blocks are still holding. Single-winner across processes:
+    // the first caller to catch the entry OPEN claims it (OPEN->CLOSING
+    // under session_open_lock, the same lock open_session() uses), sweeps,
+    // and publishes EMPTY; later callers see non-OPEN and return false
+    // without touching anything -- so concurrent PurgeSession handling by
+    // all three receivers frees each slot exactly once (double-free would
+    // corrupt the free list). Unknown id (or already closed) is a no-op
+    // returning false. After this returns true, the session slot is
+    // reusable by open_session() and block_entry()/block() reject the old
+    // generation.
+    //
+    // Runs at terminal quiescence in practice (manager purges after
+    // publish/quarantine), which is what makes the sweep safe: packets
+    // that passed block_entry() just before the OPEN->CLOSING transition
+    // may still register a bounded handful of in-flight symbols mid-sweep.
+    bool close_session(const char* session_id);
 
     BlockEntry* block_entry(uint32_t session_idx, uint32_t block_id);
 

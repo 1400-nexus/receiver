@@ -70,11 +70,15 @@ public:
     // failing (missing/undersized destination file, mmap failure).
     bool handle_session_open(const nexus::rx::SessionOpen& msg, uint64_t file_size);
 
-    // Handles an inbound PurgeSession: drops this process's decode context
-    // for the session (the BlockWriter destructor closes/munmaps the
-    // destination file; arena slots for decoded blocks were already freed
-    // per block). Unknown session_id is a no-op, not an error -- PurgeSession
-    // is idempotent and may be re-sent. After this, DataPackets for the
+    // Handles an inbound PurgeSession: reclaims every arena slot the
+    // session's undecoded blocks are still holding (via
+    // ShmManager::close_session -- single-winner across the receiver
+    // group, so concurrent purges free each slot exactly once), releases
+    // the SHM session entry for reuse, and drops this process's decode
+    // context (the BlockWriter destructor closes/munmaps the destination
+    // file; arena slots for decoded blocks were already freed per block).
+    // Unknown session_id is a no-op, not an error -- PurgeSession is
+    // idempotent and may be re-sent. After this, DataPackets for the
     // session report UnknownSession until a fresh SessionOpen reopens it.
     void purge_session(const std::string& session_id);
 

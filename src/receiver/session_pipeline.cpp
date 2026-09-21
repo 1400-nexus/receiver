@@ -40,6 +40,16 @@ bool SessionPipeline::handle_session_open(const nexus::rx::SessionOpen& msg, uin
 }
 
 void SessionPipeline::purge_session(const std::string& session_id) {
+    // Release the SHM entry first (single-winner across the receiver
+    // group; no-op for unknown ids), then drop this process's decode
+    // context. SHM-first matters: close_session() looks the entry up by
+    // id, which the local erase does not affect -- and purging by id (not
+    // by the local session_idx) also releases entries this process never
+    // opened itself. Without the SHM sweep, every symbol of every
+    // never-decoded block leaked its arena slot permanently (slots were
+    // freed only on successful decode), wedging the arena after one giant
+    // stalled session.
+    shm_.close_session(session_id.c_str());
     sessions_.erase(session_id);
 }
 
@@ -62,6 +72,16 @@ DataPacketOutcome SessionPipeline::handle_data_packet(const std::string& session
         return DataPacketOutcome::InvalidBlockOrSymbol; // block_id >= this session's total_blocks
     }
     BlockView block = *block_opt;
+
+    // Late symbols for an already-decoded block must not allocate: the
+    // block's bytes are durably on disk and its slots were freed at
+    // decode time, so there is nothing to keep a new slot for. Without
+    // this, every post-decode symbol (up to n-k=55 per block) leaks one
+    // slot until purge -- ~154k slots for a 2809-block file, nearly the
+    // whole 174k arena on its own.
+    if (block.decode_state() == DECODE_COMPLETE) {
+        return DataPacketOutcome::Duplicate;
+    }
 
     // Check first, before allocating a slot for nothing -- is_present()
     // is a cheap acquire-load, cheaper than an alloc_slot() CAS we'd just
@@ -145,9 +165,14 @@ bool SessionPipeline::decode_and_write_block(SessionContext& ctx, uint32_t block
     if (!block.mark_decode_complete()) return false; // shouldn't happen -- we hold the claim
 
     // Release every slot this block was holding -- the bytes are durably
-    // on disk now, nothing in the arena needs to keep them.
+    // on disk now, nothing in the arena needs to keep them. Clear each
+    // link so the purge sweep (which skips SLOT_IDX_FREE) cannot free
+    // the same slot a second time.
     for (uint32_t s = 0; s < ctx.n; ++s) {
-        if (present[s]) shm_.free_slot(block.slot_idx(s));
+        if (present[s]) {
+            shm_.free_slot(block.slot_idx(s));
+            block.clear_slot(s);
+        }
     }
 
     return true;
